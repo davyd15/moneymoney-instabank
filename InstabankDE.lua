@@ -1,7 +1,15 @@
 -- ============================================================
 -- MoneyMoney Web Banking Extension
 -- Instabank ASA (DE) – netbank.instabank.de
--- Version: 1.37
+-- Version: 1.39
+--
+-- Changes in 1.39:
+--  - Step 1 now triggers the SMS directly (no separate confirmation step)
+--    → only one dialog window, no gap between steps during a Rundruf
+--  - All dialog and status texts translated to German
+--  - Stale LocalStorage state is cleared at the start of each new login
+-- Changes in 1.38:
+--  - SMS-TAN-Bestätigungsdialog auf Deutsch mit Hinweis auf „Fertig"-Schaltfläche
 --
 -- Changes in 1.37:
 --  - Added confirmation step before SMS OTP to prevent duplicate SMS
@@ -15,11 +23,10 @@
 --  - Replaced custom JSON parser with built-in JSON object
 --  - Set Accept header to application/json
 --
--- Login flow (4 steps via IOtpAuthentication):
---   1. Enter credentials → show confirmation dialog (no SMS sent yet)
---   2. User confirms → POST /api/IOtpAuthentication  step=0, mobile=...   → session token
---   3. POST /api/IOtpAuthentication  step=1, otp=SMS TAN  → confirmed
---   4. POST /api/IOtpAuthentication  step=4, password=... → FvAuthorization Bearer
+-- Login flow (2 steps via IOtpAuthentication):
+--   1. Enter credentials → POST /api/IOtpAuthentication step=0 → session token → show TAN dialog
+--   2. POST /api/IOtpAuthentication step=1, otp=SMS TAN → confirmed
+--      POST /api/IOtpAuthentication step=4, password=... → FvAuthorization Bearer
 --
 -- Username = mobile number (e.g. +4917612345678)
 -- Password = account password
@@ -31,7 +38,7 @@
 -- ============================================================
 
 WebBanking {
-  version     = 1.37,
+  version     = 1.39,
   url         = "https://netbank.instabank.de",
   services    = {"Instabank Kreditkarte (DE)"},
   description = "Instabank ASA – Credit Card Germany"
@@ -53,9 +60,8 @@ end
 
 -- ============================================================
 -- InitializeSession2 – 2FA Login
---   step=1: Accept credentials → show confirmation dialog (no SMS yet)
---   step=2: User confirmed → trigger SMS → return TAN challenge
---   step=3: Accept SMS TAN → verify → fetch Bearer token
+--   step=1: Accept credentials → trigger SMS → return TAN dialog
+--   step=2: Accept SMS TAN → verify → fetch Bearer token → done
 -- ============================================================
 function InitializeSession2(protocol, bankCode, step, credentials, interactive)
   if not connection then
@@ -80,27 +86,12 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
     -- Keep password in RAM only, never write to LocalStorage
     _pendingPassword = credentials[2] or ""
 
-    -- Store mobile for step 2 (no password in LocalStorage!)
-    LocalStorage["_pending_mobile"] = mobile
+    -- Clear any stale state from a previous session
+    LocalStorage["_pending_session"] = nil
+    LocalStorage["_pending_mobile"]  = nil
 
-    -- Do not send SMS yet – wait for user confirmation
-    return {
-      title     = "Request SMS TAN?",
-      challenge = "An SMS TAN will be sent to +" .. mobile .. ".",
-    }
-
-  elseif step == 2 then
-    -- User confirmed → trigger SMS now
-    mobile = (mobile and mobile ~= "") and mobile
-             or LocalStorage["_pending_mobile"] or ""
-
-    -- Check password (may be missing e.g. after app restart between step 1 and 2)
-    if not _pendingPassword or _pendingPassword == "" then
-      LocalStorage["_pending_mobile"] = nil
-      return "Session expired. Please log in again (enter mobile number and password)."
-    end
-
-    MM.printStatus("Sending mobile number, waiting for SMS ...")
+    -- Trigger SMS immediately so there is only one dialog window
+    MM.printStatus("SMS TAN wird angefordert ...")
     local body = JSON():set({
       ["$id"] = "0",
       step    = 0,
@@ -109,20 +100,23 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
 
     local resp = apiPost("/api/IOtpAuthentication", body, "OtpAuthentication", true)
     if not resp then
-      return "Error: Server not reachable."
+      return "Fehler: Server nicht erreichbar."
     end
 
     local parsed = JSON(resp):dictionary()
     sessionToken = (parsed and parsed.session) or ""
+
+    -- Persist session token and mobile for step 2
     LocalStorage["_pending_session"] = sessionToken
+    LocalStorage["_pending_mobile"]  = mobile
 
     return {
       title     = "Instabank SMS TAN",
-      challenge = "An SMS TAN has been sent to your mobile number:",
+      challenge = "Eine SMS TAN wurde an Ihre Mobilnummer gesendet.\n\nBitte geben Sie die TAN ein:",
       label     = "SMS TAN",
     }
 
-  elseif step == 3 then
+  elseif step == 2 then
     -- Restore session and mobile from LocalStorage if needed
     sessionToken = (sessionToken and sessionToken ~= "") and sessionToken
                    or LocalStorage["_pending_session"] or ""
@@ -130,12 +124,12 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
                    or LocalStorage["_pending_mobile"] or ""
 
     -- Fetch password from RAM and clear it immediately.
-    -- If missing (e.g. after app restart between step 2 and 3),
+    -- If missing (e.g. after app restart between step 1 and 2),
     -- clean up temporary data and return a clear error message.
     if not _pendingPassword or _pendingPassword == "" then
       LocalStorage["_pending_session"] = nil
       LocalStorage["_pending_mobile"]  = nil
-      return "Session expired. Please log in again (enter mobile number and password)."
+      return "Sitzung abgelaufen. Bitte melden Sie sich erneut an (Mobilnummer und Passwort eingeben)."
     end
     local password = _pendingPassword
     _pendingPassword = nil
@@ -143,7 +137,7 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
     local tan = (credentials[1] or ""):match("^%s*(.-)%s*$") or ""
 
     -- Verify TAN
-    MM.printStatus("Verifying TAN ...")
+    MM.printStatus("TAN wird geprüft ...")
     local body2 = JSON():set({
       ["$id"] = "0",
       session = sessionToken,
@@ -158,7 +152,7 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
     end
 
     -- Send password → fetch Bearer token
-    MM.printStatus("Logging in ...")
+    MM.printStatus("Anmeldung läuft ...")
     local body3 = JSON():set({
       ["$id"]    = "0",
       session    = sessionToken,
@@ -197,10 +191,10 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
 
     -- Call IState: puts the server-side session into the "logged-in" state.
     -- The response content is irrelevant to us.
-    MM.printStatus("Initializing session ...")
+    MM.printStatus("Sitzung wird initialisiert ...")
     apiGet("/api/IState", "StateManager", "null")
 
-    MM.printStatus("Successfully logged in.")
+    MM.printStatus("Erfolgreich angemeldet.")
     return nil
   end
 end
