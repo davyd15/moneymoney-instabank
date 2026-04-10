@@ -1,8 +1,12 @@
 -- ============================================================
 -- MoneyMoney Web Banking Extension
 -- Instabank ASA (DE) – netbank.instabank.de
--- Version: 1.39
+-- Version: 1.40
 --
+-- Changes in 1.40:
+--  - Bearer Token wird nach Login in LocalStorage gespeichert
+--  - Beim nächsten Sync wird der Token wiederverwendet (kein OTP nötig)
+--  - Fallback auf normalen OTP-Flow wenn Token abgelaufen
 -- Changes in 1.39:
 --  - Step 1 now triggers the SMS directly (no separate confirmation step)
 --    → only one dialog window, no gap between steps during a Rundruf
@@ -38,7 +42,7 @@
 -- ============================================================
 
 WebBanking {
-  version     = 1.39,
+  version     = 1.40,
   url         = "https://netbank.instabank.de",
   services    = {"Instabank Kreditkarte (DE)"},
   description = "Instabank ASA – Credit Card Germany"
@@ -72,6 +76,25 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
   end
 
   if step == 1 then
+    -- Gespeicherten Bearer Token prüfen und ggf. wiederverwenden
+    local storedToken = LocalStorage["_bearer_token"]
+    if storedToken and #storedToken > 0 then
+      bearerToken = storedToken
+      MM.printStatus("Gespeichertes Token wird geprüft ...")
+      local ok, result = pcall(apiGet, "/api/IAccount?canTransfer=&customer=&customFilter=&internalTransferSource=&internalTransferTarget=", "CustomAccount", "details")
+      if ok and result then
+        -- Token ist noch gültig: aktualisierten Token speichern und Login überspringen
+        LocalStorage["_bearer_token"] = bearerToken
+        MM.printStatus("Token gültig, kein OTP nötig.")
+        return nil
+      else
+        -- Token abgelaufen: löschen und normalen Login starten
+        bearerToken = nil
+        LocalStorage["_bearer_token"] = nil
+        MM.printStatus("Token abgelaufen, SMS TAN wird angefordert ...")
+      end
+    end
+
     -- credentials[1] = mobile number, credentials[2] = password
     local rawMobile = credentials[1] or ""
     mobile = rawMobile:gsub("%s", ""):gsub("%-", "")
@@ -188,6 +211,9 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
     -- Clean up temporary LocalStorage entries
     LocalStorage["_pending_session"] = nil
     LocalStorage["_pending_mobile"]  = nil
+
+    -- Bearer Token für nächsten Sync persistieren
+    LocalStorage["_bearer_token"] = bearerToken
 
     -- Call IState: puts the server-side session into the "logged-in" state.
     -- The response content is irrelevant to us.
@@ -355,6 +381,7 @@ end
 function EndSession()
   -- No logout API call: Instabank has no valid logout endpoint.
   -- The session expires server-side after timeout.
+  -- Note: _bearer_token bleibt in LocalStorage für den nächsten Sync.
   bearerToken      = nil
   sessionToken     = nil
   mobile           = nil
