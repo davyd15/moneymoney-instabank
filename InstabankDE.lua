@@ -1,7 +1,11 @@
 -- ============================================================
 -- MoneyMoney Web Banking Extension
 -- Instabank ASA (DE) – netbank.instabank.de
--- Version: 1.40
+-- Version: 1.41
+--
+-- Changes in 1.41:
+--  - Token-Prüfung: 401-Fehler-Body wird nicht mehr als "gültig" gewertet
+--    (Server liefert bei abgelaufenem Token non-empty JSON, was fälschlich als OK galt)
 --
 -- Changes in 1.40:
 --  - Bearer Token wird nach Login in LocalStorage gespeichert
@@ -42,7 +46,7 @@
 -- ============================================================
 
 WebBanking {
-  version     = 1.40,
+  version     = 1.41,
   url         = "https://netbank.instabank.de",
   services    = {"Instabank Kreditkarte (DE)"},
   description = "Instabank ASA – Credit Card Germany"
@@ -82,7 +86,16 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
       bearerToken = storedToken
       MM.printStatus("Gespeichertes Token wird geprüft ...")
       local ok, result = pcall(apiGet, "/api/IAccount?canTransfer=&customer=&customFilter=&internalTransferSource=&internalTransferTarget=", "CustomAccount", "details")
+      local isValid = false
       if ok and result then
+        -- Prüfen ob die Antwort eine echte Kontoliste ist (Array) und kein Fehler-JSON.
+        -- Ein Fehler-Body wie {"label":"MalformedToken",...} hat keinen Integer-Index [1].
+        local parsed = JSON(result):dictionary()
+        if parsed and parsed[1] then
+          isValid = true
+        end
+      end
+      if isValid then
         -- Token ist noch gültig: aktualisierten Token speichern und Login überspringen
         LocalStorage["_bearer_token"] = bearerToken
         MM.printStatus("Token gültig, kein OTP nötig.")
